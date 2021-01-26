@@ -22,6 +22,8 @@ from torch.distributions import Independent
 from torch.nn.parameter import Parameter
 from lib.base_models import Baseline, VAE_Baseline
 
+from numba import jit
+
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
 # Exponential decay of the hidden states for RNN
 # adapted from GRU-D implementation: https://github.com/zhiyongc/GRU-D/
@@ -78,12 +80,8 @@ class GRUCellExpDecay(RNNCellBase):
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
 # Imputation with a weighed average of previous value and empirical mean 
 # adapted from GRU-D implementation: https://github.com/zhiyongc/GRU-D/
-def get_cum_delta_ts(data, delta_ts, mask):
-	n_traj, n_tp, n_dims = data.size()
-	
-	cum_delta_ts = delta_ts.repeat(1, 1, n_dims)
-	missing_index = np.where(mask.cpu().numpy() == 0)
-
+@jit(nopython=True)
+def loop_delta(missing_index, cum_delta_ts, n_tp):
 	for idx in range(missing_index[0].shape[0]):
 		i = missing_index[0][idx] 
 		j = missing_index[1][idx]
@@ -91,6 +89,17 @@ def get_cum_delta_ts(data, delta_ts, mask):
 
 		if j != 0 and j != (n_tp-1):
 		 	cum_delta_ts[i,j+1,k] = cum_delta_ts[i,j+1,k] + cum_delta_ts[i,j,k]
+	return cum_delta_ts
+
+
+def get_cum_delta_ts(data, delta_ts, mask):
+	n_traj, n_tp, n_dims = data.size()
+	
+	cum_delta_ts = delta_ts.repeat(1, 1, n_dims).cpu().numpy()
+	missing_index = np.where(mask.cpu().numpy() == 0)
+
+	cum_delta_ts = loop_delta(missing_index, cum_delta_ts, n_tp)
+	cum_delta_ts = torch.tensor(cum_delta_ts).to(get_device(data))
 	cum_delta_ts = cum_delta_ts / cum_delta_ts.max() # normalize
 
 	return cum_delta_ts
@@ -98,13 +107,43 @@ def get_cum_delta_ts(data, delta_ts, mask):
 
 # adapted from GRU-D implementation: https://github.com/zhiyongc/GRU-D/
 # very slow
-def impute_using_input_decay(data, delta_ts, mask, w_input_decay, b_input_decay):
-	n_traj, n_tp, n_dims = data.size()
+# def impute_using_input_decay(data, delta_ts, mask, w_input_decay, b_input_decay):
+# 	n_traj, n_tp, n_dims = data.size()
 
-	cum_delta_ts = delta_ts.repeat(1, 1, n_dims)
-	missing_index = np.where(mask.cpu().numpy() == 0)
+# 	cum_delta_ts = delta_ts.repeat(1, 1, n_dims)
 
-	data_last_obsv = np.copy(data.cpu().numpy())
+# 	import time
+# 	t = time.time()
+# 	missing_index = np.where(mask.cpu().numpy() == 0)
+
+# 	data_last_obsv = np.copy(data.cpu().numpy())
+# 	for idx in range(missing_index[0].shape[0]):
+# 		i = missing_index[0][idx] 
+# 		j = missing_index[1][idx]
+# 		k = missing_index[2][idx]
+
+# 		if j != 0 and j != (n_tp-1):
+# 		 	cum_delta_ts[i,j+1,k] = cum_delta_ts[i,j+1,k] + cum_delta_ts[i,j,k]
+# 		if j != 0:
+# 			data_last_obsv[i,j,k] = data_last_obsv[i,j-1,k] # last observation
+# 	cum_delta_ts = cum_delta_ts / cum_delta_ts.max() # normalize
+	
+# 	data_last_obsv = torch.Tensor(data_last_obsv).to(get_device(data))
+
+# 	print(time.time() - t)
+
+# 	zeros = torch.zeros([n_traj, n_tp, n_dims]).to(get_device(data))
+# 	decay = torch.exp( - torch.min( torch.max(zeros, 
+# 		w_input_decay * cum_delta_ts + b_input_decay), zeros + 1000 ))
+
+# 	data_means = torch.mean(data, 1).unsqueeze(1)
+
+# 	data_imputed = data * mask + (1-mask) * (decay * data_last_obsv + (1-decay) * data_means)
+# 	return data_imputed
+
+# Little faster -> 100 times
+@jit(nopython = True)
+def loop(cum_delta_ts, missing_index, data_last_obsv, n_tp): 
 	for idx in range(missing_index[0].shape[0]):
 		i = missing_index[0][idx] 
 		j = missing_index[1][idx]
@@ -114,9 +153,22 @@ def impute_using_input_decay(data, delta_ts, mask, w_input_decay, b_input_decay)
 		 	cum_delta_ts[i,j+1,k] = cum_delta_ts[i,j+1,k] + cum_delta_ts[i,j,k]
 		if j != 0:
 			data_last_obsv[i,j,k] = data_last_obsv[i,j-1,k] # last observation
-	cum_delta_ts = cum_delta_ts / cum_delta_ts.max() # normalize
 	
+	return cum_delta_ts, missing_index, data_last_obsv
+
+
+def impute_using_input_decay(data, delta_ts, mask, w_input_decay, b_input_decay):
+	n_traj, n_tp, n_dims = data.size()
+	cum_delta_ts = delta_ts.repeat(1, 1, n_dims)
+	missing_index = np.where(mask.cpu().numpy() == 0)
+
+	cum_delta_ts, missing_index, data_last_obsv = loop(cum_delta_ts.cpu().numpy(),
+			 missing_index, np.copy(data.cpu().numpy()), n_tp)
+	
+	cum_delta_ts = torch.tensor(cum_delta_ts).to(get_device(data))
 	data_last_obsv = torch.Tensor(data_last_obsv).to(get_device(data))
+
+	cum_delta_ts = cum_delta_ts / cum_delta_ts.max() # normalize
 
 	zeros = torch.zeros([n_traj, n_tp, n_dims]).to(get_device(data))
 	decay = torch.exp( - torch.min( torch.max(zeros, 
@@ -126,8 +178,6 @@ def impute_using_input_decay(data, delta_ts, mask, w_input_decay, b_input_decay)
 
 	data_imputed = data * mask + (1-mask) * (decay * data_last_obsv + (1-decay) * data_means)
 	return data_imputed
-
-
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
 
 def run_rnn(inputs, delta_ts, cell, first_hidden=None, 
