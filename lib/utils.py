@@ -531,11 +531,8 @@ def compute_loss_all_batches(model,
 	classif_predictions = torch.Tensor([]).to(device)
 	all_test_labels =  torch.Tensor([]).to(device)
 
-	for i in range(n_batches):
-		print("Computing loss... " + str(i))
-		
+	for i in range(n_batches):		
 		batch_dict = get_next_batch(test_dataloader)
-
 		results  = model.compute_all_losses(batch_dict,
 			n_traj_samples = n_traj_samples, kl_coef = kl_coef)
 
@@ -580,11 +577,9 @@ def compute_loss_all_batches(model,
 			dirname = "plots/" + str(experimentID) + "/"
 			os.makedirs(dirname, exist_ok=True)
 			
+			total["predictions"] = torch.exp(classif_predictions).cpu().numpy().reshape(-1)
 			total["auc"] = 0.
 			if torch.sum(all_test_labels) != 0.:
-				print("Number of labeled examples: {}".format(len(all_test_labels.reshape(-1))))
-				print("Number of examples with mortality 1: {}".format(torch.sum(all_test_labels == 1.)))
-
 				# Cannot compute AUC with only 1 class
 				total["auc"] = sk.metrics.roc_auc_score(all_test_labels.cpu().numpy().reshape(-1), 
 					classif_predictions.cpu().numpy().reshape(-1))
